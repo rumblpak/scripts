@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to delete all Tailscale machines with a given tag
-# Requires: curl, jq, and a Tailscale API key
+# Requires: curl, jq, sed, awk, mktemp, date, and a Tailscale API key
 
 set -euo pipefail
 
@@ -12,13 +12,6 @@ TAILNET=""
 TAG_TO_DELETE=""
 AUTO_CONFIRM=false
 
-# Detect sed version and set up compatible command
-if sed --version 2>/dev/null | grep -q GNU; then
-    SED_EXTRACT="sed -n '/^{/,\$p'"
-else
-    SED_EXTRACT="sed -n '1,/^{/!p'"
-fi
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -28,19 +21,24 @@ NC='\033[0m' # No Color
 
 # Function to print colored output
 print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    printf "${BLUE}[INFO]${NC} %s\n" "$1"
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf "${RED}[ERROR]${NC} %s\n" "$1"
+}
+
+# Function to validate JSON
+is_valid_json() {
+    jq -e '.' >/dev/null 2>&1 <<< "$1"
 }
 
 # Function to show usage
@@ -77,6 +75,22 @@ check_dependencies() {
     
     if ! command -v jq &> /dev/null; then
         missing_deps+=("jq")
+    fi
+    
+    if ! command -v sed &> /dev/null; then
+        missing_deps+=("sed")
+    fi
+    
+    if ! command -v awk &> /dev/null; then
+        missing_deps+=("awk")
+    fi
+    
+    if ! command -v mktemp &> /dev/null; then
+        missing_deps+=("mktemp")
+    fi
+    
+    if ! command -v date &> /dev/null; then
+        missing_deps+=("date")
     fi
     
     if [ ${#missing_deps[@]} -ne 0 ]; then
@@ -189,7 +203,7 @@ make_api_call() {
     
     # Get the last line (status code) and everything before it (response body)
     status_code=$(echo "$response" | tail -n1)
-    response_body=$(echo "$response" | head -n -1 | tr -d '\r')
+    response_body=$(echo "$response" | sed '$d')
     
     # Check response status
     if [[ ! "$status_code" =~ ^[0-9]+$ ]]; then
@@ -216,7 +230,7 @@ make_api_call() {
     
     # For non-empty responses, verify JSON
     if [ -n "$response_body" ]; then
-        if ! echo "$response_body" | jq -e '.' >/dev/null 2>&1; then
+        if ! is_valid_json "$response_body"; then
             print_error "Invalid JSON response received"
             echo "Raw response: $response_body" >&2
             return 1
@@ -228,7 +242,7 @@ make_api_call() {
 
 # Function to get all devices
 get_devices() {
-    print_info "Fetching all devices from tailnet: $TAILNET"
+    print_info "Fetching all devices from tailnet: $TAILNET" >&2
     make_api_call "GET" "/api/v2/tailnet/$TAILNET/devices"
 }
 
@@ -237,14 +251,8 @@ filter_devices_by_tag() {
     local devices_json="$1"
     local tag="$2"
     
-    # Store JSON in a temporary file to avoid string parsing issues
-    local tmp_file
-    tmp_file=$(mktemp)
-    echo "$devices_json" > "$tmp_file"
-    
     # Ensure we're working with valid JSON that contains devices
-    if ! jq -e '.devices' "$tmp_file" > /dev/null 2>&1; then
-        rm -f "$tmp_file"
+    if ! jq -e '.devices' >/dev/null 2>&1 <<< "$devices_json"; then
         return 1
     fi
     
@@ -262,26 +270,33 @@ filter_devices_by_tag() {
                 hostname,
                 tags
             }
-        )' "$tmp_file" 2>/dev/null)
-    rm -f "$tmp_file"
+        )' <<< "$devices_json" 2>/dev/null)
     
-    if [ "$(echo "$filter_result" | jq 'length')" -gt 0 ]; then
-        echo "$filter_result" | jq -c '.[]'
+    if [ "$(jq 'length' <<< "$filter_result")" -gt 0 ]; then
+        jq -c '.[]' <<< "$filter_result"
     fi
 }
 
-# Function to delete a device
+# Function to delete a device (parallel-safe)
 delete_device() {
     local device_id="$1"
     local device_name="$2"
+    local result_file="$3"
     
-    print_info "Deleting device: $device_name (ID: $device_id)"
+    print_info "Deleting device: $device_name (ID: $device_id)" >&2
     
-    if make_api_call "DELETE" "/api/v2/device/$device_id" > /dev/null; then
-        print_success "Successfully deleted device: $device_name"
+    local start_time=$(date +%s)
+    if make_api_call "DELETE" "/api/v2/device/$device_id" > /dev/null 2>&1; then
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        print_success "Successfully deleted device: $device_name" >&2
+        printf "%s\t%s\t%s\t%d\n" "success" "$device_id" "$device_name" "$duration" >> "$result_file"
         return 0
     else
-        print_error "Failed to delete device: $device_name"
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        print_error "Failed to delete device: $device_name" >&2
+        printf "%s\t%s\t%s\t%d\n" "failure" "$device_id" "$device_name" "$duration" >> "$result_file"
         return 1
     fi
 }
@@ -326,22 +341,24 @@ main() {
     print_info "Target tag: $TAG_TO_DELETE"
     print_info "Tailnet: $TAILNET"
     
-    # Get devices and extract JSON using compatible sed command
+    # Get devices
     local devices_response
-    devices_response=$(get_devices | eval "$SED_EXTRACT" | jq -M '.' 2>/dev/null)
-    local get_devices_status=${PIPESTATUS[0]}
+    devices_response=$(get_devices) || {
+        print_error "Failed to fetch devices"
+        exit 1
+    }
     
-    # Check if API call failed or invalid JSON
-    if [ $get_devices_status -ne 0 ] || [ -z "$devices_response" ]; then
-        print_error "Failed to fetch devices or invalid JSON response"
+    # Validate JSON response
+    if [ -z "$devices_response" ] || ! is_valid_json "$devices_response"; then
+        print_error "Invalid JSON response"
         exit 1
     fi
     
     # Check for devices array
-    if ! echo "$devices_response" | jq -e '.devices' >/dev/null 2>&1; then
+    if ! jq -e '.devices' >/dev/null 2>&1 <<< "$devices_response"; then
         print_error "JSON response missing devices array"
         echo "Response structure:"
-        echo "$devices_response" | jq -r 'keys[]' >&2
+        jq -r 'keys[]' >&2 <<< "$devices_response"
         exit 1
     fi
 
@@ -356,47 +373,124 @@ main() {
     
     # Display matching devices
     print_info "Found devices with tag '$TAG_TO_DELETE':"
-    echo "$matching_devices" | jq -r '"  - \(.name) (\(.hostname)) - ID: \(.id)"'
+    jq -r '"  - \(.name) (\(.hostname)) - ID: \(.id)"' <<< "$matching_devices"
     
     local device_count
-    device_count=$(echo "$matching_devices" | jq -s length)
+    device_count=$(jq -s length <<< "$matching_devices")
     
     # Confirm deletion
     confirm_deletion "$device_count"
     
-    # Delete devices
-    declare -i success_count=0
-    declare -i failure_count=0
-    
+    # Delete devices in parallel
     echo ""
-    print_info "Starting deletion process..."
+    print_info "Starting parallel deletion process..."
     
-    # Convert JSON to array for processing
-    mapfile -t device_ids < <(echo "$matching_devices" | jq -r '.id')
-    mapfile -t device_names < <(echo "$matching_devices" | jq -r '.name')
+    # Create temporary file for results
+    local result_file
+    result_file=$(mktemp)
     
-    # Process each device
-    local count=${#device_ids[@]}
-    for ((i=0; i<count; i++)); do
-        if [ -n "${device_ids[i]}" ] && [ -n "${device_names[i]}" ]; then
-            if delete_device "${device_ids[i]}" "${device_names[i]}"; then
-                success_count+=1
-            else
-                failure_count+=1
-            fi
+    # Ensure cleanup on exit or error
+    cleanup_temp() {
+        if [ -n "$result_file" ] && [ -f "$result_file" ]; then
+            rm -f "$result_file"
         fi
+    }
+    trap cleanup_temp EXIT INT TERM
+    
+    # Track background processes
+    local pids=()
+    local max_parallel=10  # Limit concurrent deletions to avoid rate limiting
+    local active_jobs=0
+    
+    local total_start=$(date +%s)
+    
+    # Process each device in parallel
+    while IFS=$'\t' read -r id name; do
+        if [ -n "$id" ] && [ -n "$name" ]; then
+            # Wait if we've hit the parallel limit
+            while [ $active_jobs -ge $max_parallel ]; do
+                # Wait for any job to complete
+                wait -n 2>/dev/null || true
+                active_jobs=$(($(jobs -r | wc -l)))
+            done
+            
+            # Launch deletion in background
+            delete_device "$id" "$name" "$result_file" &
+            pids+=($!)
+            active_jobs=$((active_jobs + 1))
+        fi
+    done < <(jq -r '[.id, .name] | @tsv' <<< "$matching_devices")
+    
+    # Wait for all background jobs to complete
+    print_info "Waiting for all deletions to complete..."
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
     done
     
-    # Summary
+    local total_end=$(date +%s)
+    local total_duration=$((total_end - total_start))
+    
+    # Generate summary report
     echo ""
-    print_info "Deletion completed:"
-    print_success "Successfully deleted: $success_count devices"
+    print_info "=== Deletion Summary Report ==="
+    echo ""
+    
+    # Parse results
+    declare -i success_count=0
+    declare -i failure_count=0
+    declare -a successful_devices=()
+    declare -a failed_devices=()
+    local total_api_time=0
+    
+    while IFS=$'\t' read -r status id name duration; do
+        if [ "$status" = "success" ]; then
+            success_count+=1
+            successful_devices+=("$name")
+            total_api_time=$((total_api_time + duration))
+        else
+            failure_count+=1
+            failed_devices+=("$name")
+        fi
+    done < "$result_file"
+    
+    # Display summary statistics
+    printf "Devices processed:    %d\n" "$device_count"
+    printf "Successfully deleted: %d\n" "$success_count"
+    printf "Failed to delete:     %d\n" "$failure_count"
+    printf "Total runtime:        %ds\n" "$total_duration"
+    
+    if [ $success_count -gt 0 ]; then
+        local avg_time=$((total_api_time / success_count))
+        printf "Avg deletion time:    %ds\n" "$avg_time"
+        printf "Parallelization gain: %.1fx\n" $(awk "BEGIN {printf \"%.1f\", $total_api_time / ($total_duration > 0 ? $total_duration : 1)}")
+    fi
+    
+    echo ""
+    
+    # List successful deletions
+    if [ $success_count -gt 0 ]; then
+        print_success "Successfully deleted devices:"
+        printf '%s\n' "${successful_devices[@]}" | sed 's/^/  ✓ /'
+        echo ""
+    fi
+    
+    # List failures
     if [ $failure_count -gt 0 ]; then
-        print_error "Failed to delete: $failure_count devices"
+        print_error "Failed to delete devices:"
+        printf '%s\n' "${failed_devices[@]}" | sed 's/^/  ✗ /'
+        echo ""
+        
+        # Cleanup temp file before exit
+        cleanup_temp
+        trap - EXIT INT TERM
         exit 1
     else
-        print_success "All devices with tag '$TAG_TO_DELETE' have been deleted"
+        print_success "All devices with tag '$TAG_TO_DELETE' have been deleted!"
     fi
+    
+    # Cleanup temp file on successful completion
+    cleanup_temp
+    trap - EXIT INT TERM
 }
 
 # Handle script interruption

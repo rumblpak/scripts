@@ -11,6 +11,13 @@ API_KEY=""
 TAILNET=""
 TAG_TO_DELETE=""
 
+# Detect sed version and set up compatible command
+if sed --version 2>/dev/null | grep -q GNU; then
+    SED_EXTRACT="sed -n '/^{/,\$p'"
+else
+    SED_EXTRACT="sed -n '1,/^{/!p'"
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -153,35 +160,63 @@ make_api_call() {
     local method="$1"
     local endpoint="$2"
     local data="${3:-}"
+    local response
     
-    local curl_args=(
-        -s
-        -w "%{http_code}"
-        -H "Authorization: Bearer $API_KEY"
-        -H "Content-Type: application/json"
-        -X "$method"
-    )
-    
+    # Make the API call
     if [ -n "$data" ]; then
-        curl_args+=(-d "$data")
+        response=$(curl -s -X "$method" \
+                       -H "Authorization: Bearer $API_KEY" \
+                       -H "Content-Type: application/json" \
+                       -d "$data" \
+                       -w "\n%{http_code}" \
+                       "$TAILSCALE_API_BASE$endpoint" 2>/dev/null) || return 1
+    else
+        response=$(curl -s -X "$method" \
+                       -H "Authorization: Bearer $API_KEY" \
+                       -H "Content-Type: application/json" \
+                       -w "\n%{http_code}" \
+                       "$TAILSCALE_API_BASE$endpoint" 2>/dev/null) || return 1
     fi
     
-    local response
-    response=$(curl "${curl_args[@]}" "$TAILSCALE_API_BASE$endpoint")
+    # Extract status code and response body
+    local status_code
+    local response_body
     
-    local http_code="${response: -3}"
-    local body="${response%???}"
+    # Get the last line (status code) and everything before it (response body)
+    status_code=$(echo "$response" | tail -n1)
+    response_body=$(echo "$response" | head -n -1 | tr -d '\r')
     
-    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-        echo "$body"
-        return 0
-    else
-        print_error "API call failed with HTTP $http_code"
-        if [ -n "$body" ]; then
-            print_error "Response: $body"
-        fi
+    # Check response status
+    if [[ ! "$status_code" =~ ^[0-9]+$ ]]; then
+        print_error "Invalid status code received: $status_code"
         return 1
     fi
+    
+    if [ -z "$response_body" ]; then
+        if [ "$method" = "DELETE" ] && [ "$status_code" = "200" ]; then
+            # Special case: DELETE operations might return empty body with 200
+            return 0
+        fi
+        print_error "Empty response received from API"
+        return 1
+    fi
+    
+    if [ "$status_code" != "200" ]; then
+        print_error "API request failed with status code: $status_code"
+        echo "Response: $response_body" >&2
+        return 1
+    fi
+    
+    # For non-empty responses, verify JSON
+    if [ -n "$response_body" ]; then
+        if ! echo "$response_body" | jq -e '.' >/dev/null 2>&1; then
+            print_error "Invalid JSON response received"
+            echo "Raw response: $response_body" >&2
+            return 1
+        fi
+        echo "$response_body"
+    fi
+    return 0
 }
 
 # Function to get all devices
@@ -190,16 +225,42 @@ get_devices() {
     make_api_call "GET" "/tailnet/$TAILNET/devices"
 }
 
-# Function to filter devices by tag
+    # Filter devices by tag
 filter_devices_by_tag() {
     local devices_json="$1"
     local tag="$2"
     
-    echo "$devices_json" | jq -r --arg tag "$tag" '
-        .devices[] | 
-        select(.tags != null and (.tags[] | contains($tag))) |
-        {id: .id, name: .name, hostname: .hostname, tags: .tags}
-    '
+    # Store JSON in a temporary file to avoid string parsing issues
+    local tmp_file
+    tmp_file=$(mktemp)
+    echo "$devices_json" > "$tmp_file"
+    
+    # Ensure we're working with valid JSON that contains devices
+    if ! jq -e '.devices' "$tmp_file" > /dev/null 2>&1; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    
+    # Filter and format devices
+    local filter_result
+    filter_result=$(jq -r --arg tag "$tag" '
+        .devices | map(
+            select(
+                (.tags != null) and 
+                (.tags | type == "array") and
+                (any(.tags[]; . == $tag))
+            ) | {
+                id,
+                name,
+                hostname,
+                tags
+            }
+        )' "$tmp_file" 2>/dev/null)
+    rm -f "$tmp_file"
+    
+    if [ "$(echo "$filter_result" | jq 'length')" -gt 0 ]; then
+        echo "$filter_result" | jq -c '.[]'
+    fi
 }
 
 # Function to delete a device
@@ -252,18 +313,30 @@ main() {
     print_info "Target tag: $TAG_TO_DELETE"
     print_info "Tailnet: $TAILNET"
     
-    # Get all devices
+    # Get devices and extract JSON using compatible sed command
     local devices_response
-    if ! devices_response=$(get_devices); then
-        print_error "Failed to fetch devices"
+    devices_response=$(get_devices | eval "$SED_EXTRACT" | jq -M '.' 2>/dev/null)
+    local get_devices_status=${PIPESTATUS[0]}
+    
+    # Check if API call failed or invalid JSON
+    if [ $get_devices_status -ne 0 ] || [ -z "$devices_response" ]; then
+        print_error "Failed to fetch devices or invalid JSON response"
         exit 1
     fi
     
+    # Check for devices array
+    if ! echo "$devices_response" | jq -e '.devices' >/dev/null 2>&1; then
+        print_error "JSON response missing devices array"
+        echo "Response structure:"
+        echo "$devices_response" | jq -r 'keys[]' >&2
+        exit 1
+    fi
+
     # Filter devices by tag
     local matching_devices
     matching_devices=$(filter_devices_by_tag "$devices_response" "$TAG_TO_DELETE")
     
-    if [ -z "$matching_devices" ]; then
+    if [ -z "$matching_devices" ] || [ "$matching_devices" = "null" ]; then
         print_info "No devices found with tag '$TAG_TO_DELETE'"
         exit 0
     fi
@@ -285,7 +358,7 @@ main() {
     echo ""
     print_info "Starting deletion process..."
     
-    while IFS= read -r device; do
+    echo "$matching_devices" | while IFS= read -r device; do
         if [ -n "$device" ]; then
             local device_id device_name
             device_id=$(echo "$device" | jq -r '.id')
@@ -297,7 +370,7 @@ main() {
                 ((failure_count++))
             fi
         fi
-    done <<< "$matching_devices"
+    done
     
     # Summary
     echo ""

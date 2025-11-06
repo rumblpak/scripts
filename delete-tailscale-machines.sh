@@ -6,10 +6,11 @@
 set -euo pipefail
 
 # Configuration
-TAILSCALE_API_BASE="https://api.tailscale.com/api/v2"
+TAILSCALE_API_BASE="https://api.tailscale.com"
 API_KEY=""
 TAILNET=""
 TAG_TO_DELETE=""
+AUTO_CONFIRM=false
 
 # Detect sed version and set up compatible command
 if sed --version 2>/dev/null | grep -q GNU; then
@@ -53,6 +54,7 @@ show_usage() {
     echo ""
     echo "Optional:"
     echo "  -h                  Show this help message"
+    echo "  -y                  Auto-confirm deletion without prompting"
     echo ""
     echo "Examples:"
     echo "  $0 -k \"tskey-api-...\" -n \"example.com\" -t \"tag:ephemeral\""
@@ -88,28 +90,31 @@ check_dependencies() {
 parse_options() {
     local OPTIND
     
-    while getopts "k:n:t:h" opt; do
-        case $opt in
+    while getopts ":k:n:t:hy" opt; do
+        case "${opt}" in
             k)
-                API_KEY="$OPTARG"
+                API_KEY="${OPTARG}"
                 ;;
             n)
-                TAILNET="$OPTARG"
+                TAILNET="${OPTARG}"
                 ;;
             t)
-                TAG_TO_DELETE="$OPTARG"
+                TAG_TO_DELETE="${OPTARG}"
+                ;;
+            y)
+                AUTO_CONFIRM=true
                 ;;
             h)
                 show_usage
                 exit 0
                 ;;
             \?)
-                print_error "Invalid option: -$OPTARG"
+                print_error "Invalid option: -${OPTARG}"
                 show_usage
                 exit 1
                 ;;
             :)
-                print_error "Option -$OPTARG requires an argument"
+                print_error "Option -${OPTARG} requires an argument"
                 show_usage
                 exit 1
                 ;;
@@ -192,11 +197,13 @@ make_api_call() {
         return 1
     fi
     
+    # Handle DELETE operations specially
+    if [ "$method" = "DELETE" ] && { [ "$status_code" = "200" ] || [ "$response_body" = "null" ]; }; then
+        return 0
+    fi
+    
+    # For other methods, check for empty response
     if [ -z "$response_body" ]; then
-        if [ "$method" = "DELETE" ] && [ "$status_code" = "200" ]; then
-            # Special case: DELETE operations might return empty body with 200
-            return 0
-        fi
         print_error "Empty response received from API"
         return 1
     fi
@@ -222,7 +229,7 @@ make_api_call() {
 # Function to get all devices
 get_devices() {
     print_info "Fetching all devices from tailnet: $TAILNET"
-    make_api_call "GET" "/tailnet/$TAILNET/devices"
+    make_api_call "GET" "/api/v2/tailnet/$TAILNET/devices"
 }
 
     # Filter devices by tag
@@ -270,7 +277,7 @@ delete_device() {
     
     print_info "Deleting device: $device_name (ID: $device_id)"
     
-    if make_api_call "DELETE" "/device/$device_id" > /dev/null; then
+    if make_api_call "DELETE" "/api/v2/device/$device_id" > /dev/null; then
         print_success "Successfully deleted device: $device_name"
         return 0
     else
@@ -285,6 +292,12 @@ confirm_deletion() {
     
     echo ""
     print_warning "This will delete $device_count device(s) with tag '$TAG_TO_DELETE'"
+    
+    if [ "$AUTO_CONFIRM" = true ]; then
+        print_info "Auto-confirming deletion (-y flag provided)"
+        return 0
+    fi
+    
     echo -n "Are you sure you want to continue? (y/N): "
     read -r confirmation
     
@@ -352,22 +365,24 @@ main() {
     confirm_deletion "$device_count"
     
     # Delete devices
-    local success_count=0
-    local failure_count=0
+    declare -i success_count=0
+    declare -i failure_count=0
     
     echo ""
     print_info "Starting deletion process..."
     
-    echo "$matching_devices" | while IFS= read -r device; do
-        if [ -n "$device" ]; then
-            local device_id device_name
-            device_id=$(echo "$device" | jq -r '.id')
-            device_name=$(echo "$device" | jq -r '.name')
-            
-            if delete_device "$device_id" "$device_name"; then
-                ((success_count++))
+    # Convert JSON to array for processing
+    mapfile -t device_ids < <(echo "$matching_devices" | jq -r '.id')
+    mapfile -t device_names < <(echo "$matching_devices" | jq -r '.name')
+    
+    # Process each device
+    local count=${#device_ids[@]}
+    for ((i=0; i<count; i++)); do
+        if [ -n "${device_ids[i]}" ] && [ -n "${device_names[i]}" ]; then
+            if delete_device "${device_ids[i]}" "${device_names[i]}"; then
+                success_count+=1
             else
-                ((failure_count++))
+                failure_count+=1
             fi
         fi
     done
